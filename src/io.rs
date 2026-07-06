@@ -128,6 +128,12 @@ pub fn parse_dataset(matrix: &str, labels: Option<&str>) -> Result<Dataset> {
         for tok in &r[..feat_cols] {
             let v: f64 = fast_float2::parse(tok)
                 .map_err(|_| RsomicsError::InvalidInput(format!("'{tok}' is not a number")))?;
+            if !v.is_finite() {
+                return Err(RsomicsError::InvalidInput(format!(
+                    "Input X contains NaN or infinity: '{tok}' at row {}",
+                    i + 1
+                )));
+            }
             data.push(v);
         }
     }
@@ -144,58 +150,33 @@ pub fn parse_dataset(matrix: &str, labels: Option<&str>) -> Result<Dataset> {
     })
 }
 
-/// Encode labels to dense indices over their sorted-unique set, ordered as
-/// scikit-learn's `LabelEncoder` orders the tokens read as text: an all-integer
-/// column sorts numerically (an int-dtype `np.unique`), any other column —
-/// including float-formatted strings like `1.0` — sorts lexicographically (a
-/// string-dtype `np.unique`).
+/// Encode labels to dense indices over their sorted-unique set, matching
+/// scikit-learn's `LabelEncoder` on the tokens read as text: an all-integer
+/// column groups and sorts by numeric value (an int-dtype `np.unique`, so
+/// `-0`/`0`/`01`/`+1` collapse to the value they denote), any other column —
+/// including float-formatted strings like `1.0` — groups and sorts
+/// lexicographically over the raw tokens (a string-dtype `np.unique`).
 fn encode_labels(tokens: &[&str]) -> Result<(Vec<u32>, usize)> {
     let numeric = tokens.iter().all(|s| s.parse::<i64>().is_ok());
-    let mut set: BTreeSet<Key> = BTreeSet::new();
-    for s in tokens {
-        set.insert(Key::new(s, numeric));
-    }
-    let names: Vec<&str> = set.iter().map(|k| k.raw).collect();
-    let index: std::collections::HashMap<&str, u32> = names
-        .iter()
-        .enumerate()
-        .map(|(i, &n)| (n, i as u32))
-        .collect();
-    let idx = tokens.iter().map(|s| index[s]).collect();
-    Ok((idx, names.len()))
-}
-
-/// Sort key for one label set: integer-looking labels sort by numeric value,
-/// any non-integer token forces lexicographic order over the whole set.
-struct Key<'a> {
-    sort_int: Option<i64>,
-    raw: &'a str,
-}
-
-impl<'a> Key<'a> {
-    fn new(s: &'a str, numeric: bool) -> Self {
-        let sort_int = if numeric { s.parse::<i64>().ok() } else { None };
-        Key { sort_int, raw: s }
-    }
-}
-
-impl PartialEq for Key<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.raw == other.raw
-    }
-}
-impl Eq for Key<'_> {}
-impl PartialOrd for Key<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for Key<'_> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (self.sort_int, other.sort_int) {
-            (Some(a), Some(b)) => a.cmp(&b),
-            _ => self.raw.cmp(other.raw),
-        }
+    if numeric {
+        let values: Vec<i64> = tokens.iter().map(|s| s.parse::<i64>().unwrap()).collect();
+        let uniq: BTreeSet<i64> = values.iter().copied().collect();
+        let index: std::collections::HashMap<i64, u32> = uniq
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (v, i as u32))
+            .collect();
+        let idx = values.iter().map(|v| index[v]).collect();
+        Ok((idx, uniq.len()))
+    } else {
+        let uniq: BTreeSet<&str> = tokens.iter().copied().collect();
+        let index: std::collections::HashMap<&str, u32> = uniq
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| (s, i as u32))
+            .collect();
+        let idx = tokens.iter().map(|s| index[*s]).collect();
+        Ok((idx, uniq.len()))
     }
 }
 
@@ -234,5 +215,32 @@ mod tests {
     #[test]
     fn ragged_matrix_fails() {
         assert!(parse_dataset("1.0 2.0 0\n3.0 1\n", None).is_err());
+    }
+
+    #[test]
+    fn int_labels_dedup_by_value_not_text() {
+        // '-0' and '0' both denote 0; sklearn's integer LabelEncoder collapses
+        // them to one cluster. Earlier this panicked keying the index by raw text.
+        let d = parse_dataset("1.0 0\n2.0 -0\n8.0 2\n9.0 2\n", None).unwrap();
+        assert_eq!(d.labels, [0, 0, 1, 1]);
+        assert_eq!(d.n_clusters, 2);
+    }
+
+    #[test]
+    fn int_labels_dedup_leading_zero_and_plus() {
+        let d = parse_dataset("1.0 01\n2.0 1\n8.0 +2\n9.0 2\n", None).unwrap();
+        assert_eq!(d.labels, [0, 0, 1, 1]);
+        assert_eq!(d.n_clusters, 2);
+    }
+
+    #[test]
+    fn nan_feature_fails_loud() {
+        assert!(parse_dataset("1.0 0\nnan 0\n8.0 1\n9.0 1\n", None).is_err());
+    }
+
+    #[test]
+    fn inf_feature_fails_loud() {
+        assert!(parse_dataset("1.0 0\ninf 0\n8.0 1\n9.0 1\n", None).is_err());
+        assert!(parse_dataset("1.0 0\n-Infinity 0\n8.0 1\n9.0 1\n", None).is_err());
     }
 }

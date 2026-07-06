@@ -325,6 +325,68 @@ fn k_equals_n_fails_loud() {
     );
 }
 
+/// Textually-varied integer labels (`-0`/`0`/`00`, `+2`/`2`) collapse by numeric
+/// value the way scikit-learn's integer `LabelEncoder` does. Compared against a
+/// committed golden generated from sklearn 1.9.0 (no live oracle).
+#[test]
+fn int_label_dedup_matches_sklearn() {
+    let gd = golden_dir();
+    let m = gd.join("intdedup_X.tsv");
+    let score: f64 = run_st(&["--metric", "euclidean", m.to_str().unwrap()])
+        .trim()
+        .parse()
+        .unwrap();
+    let want_score = from_hexbits("3fef963508dcf81b");
+    assert!(
+        (score - want_score).abs() <= 1e-12,
+        "int-dedup score got {score}, want {want_score}"
+    );
+
+    let out = run_st(&["--metric", "euclidean", m.to_str().unwrap(), "--samples"]);
+    let got: Vec<f64> = out.split_whitespace().map(|s| s.parse().unwrap()).collect();
+    let want: Vec<f64> = std::fs::read_to_string(gd.join("intdedup__euclidean.samples.hex"))
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(from_hexbits)
+        .collect();
+    assert_eq!(got.len(), want.len(), "int-dedup sample count mismatch");
+    assert_eq!(
+        got.len(),
+        8,
+        "int-dedup expects 8 samples (2 clusters, no panic)"
+    );
+    for (&g, &w) in got.iter().zip(&want) {
+        assert!((g - w).abs() <= 1e-12, "int-dedup sample got {g}, want {w}");
+    }
+}
+
+/// A non-finite feature cell (NaN / infinity) must fail loud, matching
+/// scikit-learn's `check_X_y(force_all_finite=True)` `ValueError` — never a
+/// silent score-0.
+#[test]
+fn nonfinite_feature_fails_loud() {
+    for cell in ["nan", "inf", "-inf", "Infinity"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.tsv");
+        std::fs::write(&path, format!("1.0 0\n{cell} 0\n8.0 1\n9.0 1\n")).unwrap();
+        let out = Command::new(bin())
+            .args(["--metric", "euclidean", path.to_str().unwrap()])
+            .output()
+            .expect("run");
+        assert!(
+            !out.status.success(),
+            "non-finite feature '{cell}' must fail loud, got exit {:?}",
+            out.status.code()
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !err.trim().is_empty(),
+            "non-finite feature '{cell}' must print a diagnostic to stderr"
+        );
+    }
+}
+
 #[test]
 fn help_exits_zero() {
     let out = Command::new(bin())
